@@ -1,6 +1,6 @@
 #![feature(let_else)]
 
-use std::{collections::HashMap, io::Write, thread};
+use std::{collections::HashMap, io::Write, sync::atomic::AtomicUsize, thread};
 
 pub fn write_results_csv(results: Vec<Vec<&str>>, output: &mut impl Write) {
     for result in results {
@@ -14,6 +14,8 @@ pub fn write_results_csv(results: Vec<Vec<&str>>, output: &mut impl Write) {
         writeln!(output).unwrap()
     }
 }
+
+const STEP_SIZE: usize = 100;
 
 pub fn solve(words: Vec<&str>) -> Vec<Vec<&str>> {
     let mut masks_to_words: HashMap<u32, Vec<&str>> = HashMap::new();
@@ -37,30 +39,50 @@ pub fn solve(words: Vec<&str>) -> Vec<Vec<&str>> {
         .unwrap_or(2.try_into().unwrap())
         .into();
 
+    // The number of words already taken by previous threads
+    let taken = AtomicUsize::new(0);
+
     thread::scope(|scope| {
         (0..threads)
-            .map(|i| {
+            .map(|_| {
+                // Three magic lines to make the borrow checker happy.
                 let masks = &masks;
                 let masks_to_words = &masks_to_words;
+                let taken = &taken;
                 scope.spawn::<_, Vec<Vec<&str>>>(move || {
+                    let mut results = vec![];
+                    // We can reuse these allocations, even though it does not have a performance impact whatsoever.
+                    let mut recycled_vecs = vec![];
                     let mut masks_results = vec![];
-                    let mut solver = StepSolver {
-                        words: &masks[masks.len() * i / threads..],
-                        previous_letters: 0,
-                        requested_len: 5,
-                        recycled_vecs: &mut vec![],
-                        results: &mut masks_results,
-                        first_step_end_idx: (masks.len() * (i + 1) / threads)
-                            - (masks.len() * i / threads),
-                    };
+                    loop {
+                        // Read where we could continue the work and add STEP_SIZE to claim this chunk of words for us.
+                        let start = taken.fetch_add(STEP_SIZE, std::sync::atomic::Ordering::AcqRel);
+                        if start >= masks.len() {
+                            // All words were already taken care of.
+                            break;
+                        }
+                        // There might be less words left than STEP_SIZE.
+                        let end = masks.len().min(start + STEP_SIZE);
+                        masks_results.clear();
+                        let mut solver = StepSolver {
+                            words: &masks[start..],
+                            previous_letters: 0,
+                            requested_len: 5,
+                            recycled_vecs: &mut recycled_vecs,
+                            results: &mut masks_results,
+                            first_step_end_idx: end - start,
+                        };
 
-                    solver.next_step();
+                        solver.next_step();
 
-                    masks_results
-                        .iter()
-                        .map(|result| compile_results(result, &masks_to_words))
-                        .flatten()
-                        .collect()
+                        results.extend(
+                            masks_results
+                                .iter()
+                                .map(|result| compile_results(result, &masks_to_words))
+                                .flatten(),
+                        );
+                    }
+                    results
                 })
             })
             .collect::<Vec<_>>()
