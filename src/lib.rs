@@ -1,6 +1,6 @@
 #![feature(let_else)]
 
-use std::{collections::HashMap, io::Write};
+use std::{collections::HashMap, io::Write, thread};
 
 pub fn write_results_csv(results: Vec<Vec<&str>>, output: &mut impl Write) {
     for result in results {
@@ -31,18 +31,47 @@ pub fn solve(words: Vec<&str>) -> Vec<Vec<&str>> {
             masks_to_words.insert(mask, vec![word]);
         }
     }
-    let mut masks: Vec<_> = masks_to_words.keys().cloned().collect();
+    let masks: Vec<_> = masks_to_words.keys().cloned().collect();
 
-    let mut solver = StepSolver::new(&mut masks, 5);
-    let mut masks_results = vec![];
+    let threads = thread::available_parallelism()
+        .unwrap_or(2.try_into().unwrap())
+        .into();
 
-    solver.next_step(&mut vec![], &mut masks_results);
+    thread::scope(|scope| {
+        (0..threads)
+            .map(|i| {
+                let masks = &masks;
+                let masks_to_words = &masks_to_words;
+                scope.spawn::<_, Vec<Vec<&str>>>(move || {
+                    let mut masks_results = vec![];
+                    let mut solver = StepSolver {
+                        words: &masks[masks.len() * i / threads..],
+                        previous_letters: 0,
+                        requested_len: 5,
+                        recycled_vecs: &mut vec![],
+                        results: &mut masks_results,
+                        first_step_end_idx: (masks.len() * (i + 1) / threads)
+                            - (masks.len() * i / threads),
+                    };
 
-    masks_results
-        .iter()
-        .map(|result| compile_results(result, &masks_to_words))
-        .flatten()
-        .collect()
+                    solver.next_step();
+
+                    masks_results
+                        .iter()
+                        .map(|result| compile_results(result, &masks_to_words))
+                        .flatten()
+                        .collect()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .reduce(|mut a, mut b| {
+                a.append(&mut b);
+                a
+            })
+            .unwrap_or(vec![])
+    })
 }
 
 /// Converts the masks returned from the solver back to strings. Also handles anagrams.
@@ -88,36 +117,28 @@ fn get_mask(word: &str) -> Option<u32> {
     Some(mask)
 }
 
-struct StepSolver<'a> {
-    words: &'a mut Vec<LettersMask>,
+struct StepSolver<'a, 'b> {
+    words: &'a [LettersMask],
     previous_letters: LettersMask,
     requested_len: usize,
+    recycled_vecs: &'b mut Vec<Vec<LettersMask>>,
+    results: &'b mut Vec<Vec<u32>>,
+    first_step_end_idx: usize,
 }
 
-impl<'a> StepSolver<'a> {
-    fn new(words: &'a mut Vec<LettersMask>, requested_len: usize) -> Self {
-        Self {
-            words,
-            previous_letters: 0,
-            requested_len,
-        }
-    }
-    fn next_step(
-        &mut self,
-        recycled_vecs: &mut Vec<Vec<LettersMask>>,
-        results: &mut Vec<Vec<u32>>,
-    ) {
+impl<'a, 'b> StepSolver<'a, 'b> {
+    fn next_step(&mut self) {
         if self.requested_len == 0 {
-            results.push(vec![]);
+            self.results.push(vec![]);
             return;
         }
         if self.words.len() < self.requested_len {
             return;
         }
 
-        let mut recycled_vec = recycled_vecs.pop().unwrap_or_else(|| vec![]);
+        let mut recycled_vec = self.recycled_vecs.pop().unwrap_or_else(|| vec![]);
 
-        for (idx, &word) in self.words.iter().enumerate() {
+        for (idx, &word) in self.words[..self.first_step_end_idx].iter().enumerate() {
             let new_mask = self.previous_letters | word;
 
             // reusing previous allocations helps performance quite a bit
@@ -129,20 +150,26 @@ impl<'a> StepSolver<'a> {
                     .cloned(),
             );
 
+            let previous_results_len = self.results.len();
+
+            let words_len = recycled_vec.len();
+
             let mut next_solver = StepSolver {
                 words: &mut recycled_vec,
                 previous_letters: new_mask,
                 requested_len: self.requested_len - 1,
+                recycled_vecs: self.recycled_vecs,
+                results: self.results,
+                first_step_end_idx: words_len,
             };
 
             // add the current word to all newly added results
-            let previous_results_len = results.len();
-            next_solver.next_step(recycled_vecs, results);
-            for result in &mut results[previous_results_len..] {
+            next_solver.next_step();
+            for result in &mut self.results[previous_results_len..] {
                 result.push(word);
             }
         }
 
-        recycled_vecs.push(recycled_vec);
+        self.recycled_vecs.push(recycled_vec);
     }
 }
